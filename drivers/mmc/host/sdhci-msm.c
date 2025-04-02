@@ -81,6 +81,7 @@
 #define CORE_IO_PAD_PWR_SWITCH_EN	BIT(15)
 #define CORE_IO_PAD_PWR_SWITCH	BIT(16)
 #define CORE_HC_SELECT_IN_EN	BIT(18)
+#define CORE_HC_SELECT_IN_SDR50	(4 << 19)
 #define CORE_HC_SELECT_IN_HS400	(6 << 19)
 #define CORE_HC_SELECT_IN_MASK	(7 << 19)
 
@@ -146,6 +147,8 @@
 /* Max load for SD Vdd-io supply */
 #define SD_VQMMC_MAX_LOAD_UA	22000
 
+#define LEVEL_SHIFTER_HIGH_SPEED_FREQ	37500000
+
 #define msm_host_readl(msm_host, host, offset) \
 	msm_host->var_ops->msm_readl_relaxed(host, offset)
 
@@ -155,6 +158,7 @@
 /* CQHCI vendor specific registers */
 #define CQHCI_VENDOR_CFG1	0xA00
 #define CQHCI_VENDOR_DIS_RST_ON_CQ_EN	(0x3 << 13)
+#define RCLK_TOGGLE BIT(1)
 
 struct sdhci_msm_offset {
 	u32 core_hc_mode;
@@ -295,10 +299,12 @@ struct sdhci_msm_host {
 	bool use_cdr;
 	u32 transfer_mode;
 	bool updated_ddr_cfg;
+	bool uses_level_shifter;
 	bool uses_tassadar_dll;
 	u32 dll_config;
 	u32 ddr_config;
 	bool vqmmc_enabled;
+	bool toggle_fifo_clk;
 };
 
 static const struct sdhci_msm_offset *sdhci_priv_msm_offset(struct sdhci_host *host)
@@ -374,6 +380,11 @@ static void msm_set_clock_rate_for_bus_mode(struct sdhci_host *host,
 
 	mult = msm_get_clock_mult_for_bus_mode(host);
 	desired_rate = clock * mult;
+
+	if (curr_ios.timing == MMC_TIMING_SD_HS && desired_rate == 50000000
+		&& msm_host->uses_level_shifter)
+		desired_rate = LEVEL_SHIFTER_HIGH_SPEED_FREQ;
+
 	rc = dev_pm_opp_set_rate(mmc_dev(host->mmc), desired_rate);
 	if (rc) {
 		pr_err("%s: Failed to set clock at rate %u at timing %d\n",
@@ -1133,6 +1144,10 @@ static bool sdhci_msm_is_tuning_needed(struct sdhci_host *host)
 {
 	struct mmc_ios *ios = &host->mmc->ios;
 
+	if (ios->timing == MMC_TIMING_UHS_SDR50 &&
+			host->flags & SDHCI_SDR50_NEEDS_TUNING)
+		return true;
+
 	/*
 	 * Tuning is required for SDR104, HS200 and HS400 cards and
 	 * if clock frequency is greater than 100MHz in these modes.
@@ -1171,6 +1186,39 @@ static int sdhci_msm_restore_sdr_dll_config(struct sdhci_host *host)
 	return ret;
 }
 
+/*
+ * After MCLK ugating, toggle the FIFO write clock to get
+ * the FIFO pointers and flags to valid state.
+ */
+static void sdhci_msm_toggle_fifo_write_clk(struct sdhci_host *host)
+{
+	u32 config;
+	struct mmc_ios ios = host->mmc->ios;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct sdhci_msm_host *msm_host = sdhci_pltfm_priv(pltfm_host);
+	const struct sdhci_msm_offset *msm_offset = msm_host->offset;
+
+	if ((msm_host->tuning_done || ios.enhanced_strobe) &&
+		host->mmc->ios.timing == MMC_TIMING_MMC_HS400) {
+		/*
+		 * Select MCLK as DLL input clock.
+		 */
+		config = readl_relaxed(host->ioaddr + msm_offset->core_dll_config_3);
+		config |= RCLK_TOGGLE;
+		writel_relaxed(config, host->ioaddr + msm_offset->core_dll_config_3);
+
+		/* ensure above write as toggling same bit quickly */
+		wmb();
+		udelay(2);
+
+		/*
+		 * Select RCLK as DLL input clock
+		 */
+		config &= ~RCLK_TOGGLE;
+		writel_relaxed(config, host->ioaddr + msm_offset->core_dll_config_3);
+	}
+}
+
 static void sdhci_msm_set_cdr(struct sdhci_host *host, bool enable)
 {
 	const struct sdhci_msm_offset *msm_offset = sdhci_priv_msm_offset(host);
@@ -1201,6 +1249,8 @@ static int sdhci_msm_execute_tuning(struct mmc_host *mmc, u32 opcode)
 	struct mmc_ios ios = host->mmc->ios;
 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 	struct sdhci_msm_host *msm_host = sdhci_pltfm_priv(pltfm_host);
+	const struct sdhci_msm_offset *msm_offset = msm_host->offset;
+	u32 config;
 
 	if (!sdhci_msm_is_tuning_needed(host)) {
 		msm_host->use_cdr = false;
@@ -1216,6 +1266,15 @@ static int sdhci_msm_execute_tuning(struct mmc_host *mmc, u32 opcode)
 	 * HS400 settings.
 	 */
 	msm_host->tuning_done = 0;
+
+	if (ios.timing == MMC_TIMING_UHS_SDR50 &&
+			host->flags & SDHCI_SDR50_NEEDS_TUNING) {
+		config = readl_relaxed(host->ioaddr + msm_offset->core_vendor_spec);
+		config |= CORE_HC_SELECT_IN_EN;
+		config &= ~CORE_HC_SELECT_IN_MASK;
+		config |= CORE_HC_SELECT_IN_SDR50;
+		writel_relaxed(config, host->ioaddr + msm_offset->core_vendor_spec);
+	}
 
 	/*
 	 * For HS400 tuning in HS200 timing requires:
@@ -2461,6 +2520,8 @@ static inline void sdhci_msm_get_of_property(struct platform_device *pdev,
 
 	of_property_read_u32(node, "qcom,dll-config", &msm_host->dll_config);
 
+	msm_host->uses_level_shifter = of_property_read_bool(node, "qcom,use-level-shifter");
+
 	if (of_device_is_compatible(node, "qcom,msm8916-sdhci"))
 		host->quirks2 |= SDHCI_QUIRK2_BROKEN_64_BIT_DMA;
 }
@@ -2692,6 +2753,9 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	if (core_major == 1 && core_minor >= 0x71)
 		msm_host->uses_tassadar_dll = true;
 
+	if (core_major == 1 && core_minor >= 0x6B)
+		msm_host->toggle_fifo_clk = true;
+
 	ret = sdhci_msm_register_vreg(msm_host);
 	if (ret)
 		goto clk_disable;
@@ -2825,6 +2889,9 @@ static __maybe_unused int sdhci_msm_runtime_resume(struct device *dev)
 				       msm_host->bulk_clks);
 	if (ret)
 		return ret;
+
+	if (msm_host->toggle_fifo_clk)
+		sdhci_msm_toggle_fifo_write_clk(host);
 	/*
 	 * Whenever core-clock is gated dynamically, it's needed to
 	 * restore the SDR DLL settings when the clock is ungated.
